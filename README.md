@@ -16,6 +16,17 @@ Some routers (e.g. many home routers) rarely answer traceroute probes and show f
 **Direct ping hops** to also ping each hop's address directly (like `pathping`); a hop then counts as
 answering if it replies to either the traceroute probe or the direct ping.
 
+## Download
+
+Latest release ([all releases](https://github.com/anneb/pingplot/releases)):
+
+- Windows x64: [pingplot.exe](https://github.com/anneb/pingplot/releases/latest/download/pingplot.exe)
+  (not code-signed, SmartScreen may warn)
+- Linux x86_64: [pingplot-linux-x86_64](https://github.com/anneb/pingplot/releases/latest/download/pingplot-linux-x86_64)
+  (glibc 2.17+; run `chmod +x pingplot-linux-x86_64` after download)
+
+No installer: put the binary anywhere, e.g. a folder on your PATH.
+
 ## Usage
 
 ```
