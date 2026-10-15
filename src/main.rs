@@ -68,6 +68,7 @@ struct App {
     host: String,
     interval_ms: u64,
     focus: f64,
+    direct: bool,
     trace: Option<Trace>,
     error: Option<String>,
     /// Selected hop index for the timeline; None = destination.
@@ -82,6 +83,7 @@ impl App {
         self.selected = None;
         match Trace::start(self.host.trim(), self.interval_ms) {
             Ok(t) => {
+                t.direct.store(self.direct, std::sync::atomic::Ordering::Relaxed);
                 self.trace = Some(t);
                 self.error = None;
             }
@@ -94,6 +96,9 @@ impl App {
         let hops = t.hops.lock().unwrap();
         let since = t.elapsed() - self.focus;
         let mut s = format!("PingPlot trace to {} ({})\n", t.host, t.target);
+        if self.direct {
+            s += "Hops measured by pinging their address directly\n";
+        }
         s += &format!(
             "{:>3}  {:<55} {:>6} {:>5} {:>5} {:>7} {:>7} {:>7} {:>7}\n",
             "Hop", "Host", "Loss%", "Sent", "Recv", "Best", "Avg", "Worst", "Last"
@@ -161,6 +166,15 @@ impl eframe::App for App {
                             ui.selectable_value(&mut self.focus, secs, name);
                         }
                     });
+
+                ui.checkbox(&mut self.direct, "Direct ping hops").on_hover_text(
+                    "Also ping each hop's address directly (like pathping); a hop counts as\n\
+                     answering if it replies to the traceroute probe or the direct ping.\n\
+                     Use for routers that rarely answer traceroute probes and show false loss.",
+                );
+                if let Some(t) = &self.trace {
+                    t.direct.store(self.direct, std::sync::atomic::Ordering::Relaxed);
+                }
 
                 ui.separator();
                 if ui.add_enabled(self.trace.is_some(), egui::Button::new("📋 Copy")).clicked() {
@@ -376,7 +390,7 @@ fn main() -> eframe::Result {
         "PingPlot",
         options,
         Box::new(move |_cc| {
-            let mut app = App { host, interval_ms: 1000, focus: 600.0, trace: None, error: None, selected: None };
+            let mut app = App { host, interval_ms: 1000, focus: 600.0, direct: false, trace: None, error: None, selected: None };
             if !app.host.is_empty() {
                 app.start();
             }

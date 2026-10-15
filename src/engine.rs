@@ -19,6 +19,8 @@ pub struct Sample {
     pub t: f64,
     /// Round trip time in ms, None = lost.
     pub rtt: Option<f64>,
+    /// Measured in direct mode (reply to the TTL probe or the direct ping).
+    pub direct: bool,
 }
 
 #[derive(Default, Clone)]
@@ -79,6 +81,9 @@ pub struct Trace {
     pub target: Ipv4Addr,
     pub hops: Arc<Mutex<Vec<Hop>>>,
     pub interval_ms: Arc<AtomicU64>,
+    /// Measure hops by pinging their address directly (like pathping) instead
+    /// of using the TTL probe. Helps with routers that rarely send Time Exceeded.
+    pub direct: Arc<AtomicBool>,
     dest_ttl: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     start: Instant,
@@ -106,16 +111,25 @@ impl Trace {
             target,
             hops: Arc::new(Mutex::new(vec![Hop::default(); MAX_HOPS])),
             interval_ms: Arc::new(AtomicU64::new(interval_ms)),
+            direct: Arc::new(AtomicBool::new(false)),
             dest_ttl: Arc::new(AtomicUsize::new(0)),
             stop: Arc::new(AtomicBool::new(false)),
             start: Instant::now(),
         };
         for ttl in 1..=MAX_HOPS {
-            let (hops, iv, dest, stop, start) =
-                (t.hops.clone(), t.interval_ms.clone(), t.dest_ttl.clone(), t.stop.clone(), t.start);
+            let ctx = HopCtx {
+                ttl,
+                target,
+                hops: t.hops.clone(),
+                interval_ms: t.interval_ms.clone(),
+                direct: t.direct.clone(),
+                dest_ttl: t.dest_ttl.clone(),
+                stop: t.stop.clone(),
+                start: t.start,
+            };
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(ttl as u64 * 30));
-                hop_thread(ttl, target, hops, iv, dest, stop, start)
+                hop_thread(ctx)
             });
         }
         Ok(t)
@@ -148,42 +162,96 @@ impl Drop for Trace {
     }
 }
 
-fn hop_thread(
+#[derive(Clone)]
+struct HopCtx {
     ttl: usize,
     target: Ipv4Addr,
     hops: Arc<Mutex<Vec<Hop>>>,
     interval_ms: Arc<AtomicU64>,
+    direct: Arc<AtomicBool>,
     dest_ttl: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     start: Instant,
-) {
-    let Some(pinger) = icmp::Pinger::new() else { return };
-    while !stop.load(Ordering::Relaxed) {
-        let d = dest_ttl.load(Ordering::Relaxed);
-        if d != 0 && ttl > d {
-            return;
-        }
-        let sent_at = Instant::now();
-        let t = (sent_at - start).as_secs_f64();
-        let reply = pinger.ping(target, ttl as u8, TIMEOUT_MS);
-        let rtt = reply.map(|_| sent_at.elapsed().as_secs_f64() * 1000.0);
+}
 
-        if let Some(addr) = reply {
-            if addr == target {
-                // Lowest TTL that reaches the target is the destination.
-                let _ = dest_ttl.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-                    (cur == 0 || ttl < cur).then_some(ttl)
+impl HopCtx {
+    fn stopped(&self) -> bool {
+        let d = self.dest_ttl.load(Ordering::Relaxed);
+        self.stop.load(Ordering::Relaxed) || (d != 0 && self.ttl > d)
+    }
+
+    /// Address to ping directly, if direct mode applies to this hop.
+    fn direct_addr(&self, hop: &Hop) -> Option<Ipv4Addr> {
+        hop.addr.filter(|&a| a != self.target && self.direct.load(Ordering::Relaxed))
+    }
+
+    fn record(&self, hop: &mut Hop, t: f64, rtt: Option<f64>, direct: bool) {
+        // Don't mix both kinds of measurement in one history.
+        if hop.samples.back().is_some_and(|s| s.direct != direct) {
+            hop.samples.clear();
+        }
+        hop.samples.push_back(Sample { t, rtt, direct });
+        if hop.samples.len() > MAX_SAMPLES {
+            hop.samples.pop_front();
+        }
+    }
+
+    /// Wait until one interval after `sent_at`, in small steps so Stop reacts quickly.
+    fn wait(&self, sent_at: Instant) {
+        let until = sent_at + Duration::from_millis(self.interval_ms.load(Ordering::Relaxed));
+        while Instant::now() < until && !self.stop.load(Ordering::Relaxed) {
+            thread::sleep((until - Instant::now()).min(Duration::from_millis(100)));
+        }
+    }
+}
+
+/// TTL-limited probe each interval to discover the hop. In direct mode a
+/// normal echo to the hop's address is sent at the same time, and the hop
+/// counts as answering if either probe gets a reply.
+fn hop_thread(cx: HopCtx) {
+    let ttl = cx.ttl;
+    let Some(pinger) = icmp::Pinger::new() else { return };
+    let mut direct_pinger = icmp::Pinger::new();
+    let ms_since = |at: Instant| at.elapsed().as_secs_f64() * 1000.0;
+    while !cx.stopped() {
+        let sent_at = Instant::now();
+        let t = (sent_at - cx.start).as_secs_f64();
+        let direct_to = cx.direct_addr(&cx.hops.lock().unwrap()[ttl - 1]);
+        let probe = || {
+            let reply = pinger.ping(cx.target, ttl as u8, TIMEOUT_MS);
+            (reply, reply.map(|_| ms_since(sent_at)))
+        };
+        let ((reply, rtt), direct_rtt) = match (direct_to, direct_pinger.take()) {
+            (Some(addr), Some(dp)) => thread::scope(|s| {
+                let h = s.spawn(move || {
+                    let rtt = (dp.ping(addr, 64, TIMEOUT_MS) == Some(addr)).then(|| ms_since(sent_at));
+                    (dp, rtt)
                 });
+                let ttl_result = probe();
+                let (dp, rtt) = h.join().unwrap();
+                direct_pinger = Some(dp);
+                (ttl_result, rtt)
+            }),
+            (_, dp) => {
+                direct_pinger = dp;
+                (probe(), None)
             }
+        };
+
+        if reply == Some(cx.target) {
+            // Lowest TTL that reaches the target is the destination.
+            let _ = cx.dest_ttl.try_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                (cur == 0 || ttl < cur).then_some(ttl)
+            });
         }
         {
-            let mut hs = hops.lock().unwrap();
+            let mut hs = cx.hops.lock().unwrap();
             let hop = &mut hs[ttl - 1];
             if let Some(addr) = reply {
                 if hop.addr != Some(addr) {
                     hop.addr = Some(addr);
                     hop.name = None;
-                    let hops = hops.clone();
+                    let hops = cx.hops.clone();
                     thread::spawn(move || {
                         if let Ok(name) = dns_lookup::lookup_addr(&IpAddr::V4(addr)) {
                             let mut hs = hops.lock().unwrap();
@@ -194,20 +262,14 @@ fn hop_thread(
                     });
                 }
             }
-            hop.samples.push_back(Sample { t, rtt });
-            if hop.samples.len() > MAX_SAMPLES {
-                hop.samples.pop_front();
+            if direct_to.is_some() {
+                // Prefer the direct RTT: it is not delayed by Time Exceeded generation.
+                cx.record(hop, t, direct_rtt.or(rtt), true);
+            } else {
+                cx.record(hop, t, rtt, false);
             }
         }
-        let wait = Duration::from_millis(interval_ms.load(Ordering::Relaxed));
-        let spent = sent_at.elapsed();
-        if spent < wait {
-            // Sleep in small steps so Stop reacts quickly.
-            let until = sent_at + wait;
-            while Instant::now() < until && !stop.load(Ordering::Relaxed) {
-                thread::sleep((until - Instant::now()).min(Duration::from_millis(100)));
-            }
-        }
+        cx.wait(sent_at);
     }
 }
 
@@ -224,6 +286,8 @@ mod icmp {
     const IP_TTL_EXPIRED_TRANSIT: u32 = 11013;
 
     pub struct Pinger(HANDLE);
+    // The ICMP handle may be used from any thread (moved to a helper thread in direct mode).
+    unsafe impl Send for Pinger {}
 
     impl Pinger {
         pub fn new() -> Option<Self> {

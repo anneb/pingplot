@@ -12,6 +12,10 @@ check with `sysctl net.ipv4.ping_group_range`). macOS support is untested.
 Features: per-hop loss and latency stats, latency graph across hops, timeline for the selected hop,
 adjustable interval and focus period, copy results as text.
 
+Some routers (e.g. many home routers) rarely answer traceroute probes and show false loss. Tick
+**Direct ping hops** to also ping each hop's address directly (like `pathping`); a hop then counts as
+answering if it replies to either the traceroute probe or the direct ping.
+
 ## Usage
 
 ```
