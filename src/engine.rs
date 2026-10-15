@@ -1,6 +1,6 @@
 //! Trace engine: one thread per TTL, each pinging the target with that TTL
-//! at a fixed interval (same approach as WinMTR). Uses the Windows ICMP API
-//! (IcmpSendEcho), which works without administrator rights.
+//! at a fixed interval (same approach as WinMTR). Needs no administrator/root
+//! rights: Windows ICMP API (IcmpSendEcho) or ICMP datagram sockets on Unix.
 
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, ToSocketAddrs};
@@ -267,16 +267,225 @@ mod icmp {
     }
 }
 
-#[cfg(not(windows))]
+/// Linux and macOS: unprivileged ICMP datagram socket (SOCK_DGRAM, IPPROTO_ICMP).
+/// On Linux this needs the user's group in net.ipv4.ping_group_range (default on
+/// most distributions and WSL). Linux reports Time Exceeded through the socket
+/// error queue (IP_RECVERR); macOS delivers it as a normal packet with IP header.
+#[cfg(unix)]
 mod icmp {
+    use std::cell::Cell;
     use std::net::Ipv4Addr;
-    pub struct Pinger;
+    use std::sync::atomic::{AtomicU16, Ordering};
+    use std::time::{Duration, Instant};
+
+    const ECHO_REPLY: u8 = 0;
+    #[cfg(not(target_os = "linux"))]
+    const DEST_UNREACH: u8 = 3;
+    const ECHO_REQUEST: u8 = 8;
+    const TIME_EXCEEDED: u8 = 11;
+
+    static NEXT_ID: AtomicU16 = AtomicU16::new(0);
+
+    enum Got {
+        Reply(Ipv4Addr),
+        Failed,
+        Other,
+    }
+
+    pub struct Pinger {
+        fd: libc::c_int,
+        /// Echo identifier; Linux replaces it with the socket's own id.
+        id: u16,
+        seq: Cell<u16>,
+    }
+
     impl Pinger {
         pub fn new() -> Option<Self> {
-            None
+            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, libc::IPPROTO_ICMP) };
+            if fd < 0 {
+                return None;
+            }
+            let p = Pinger {
+                fd,
+                id: (std::process::id() as u16).wrapping_add(NEXT_ID.fetch_add(1, Ordering::Relaxed)),
+                seq: Cell::new(0),
+            };
+            #[cfg(target_os = "linux")]
+            if !p.set_opt(libc::IP_RECVERR, 1) {
+                return None;
+            }
+            Some(p)
         }
-        pub fn ping(&self, _: Ipv4Addr, _: u8, _: u32) -> Option<Ipv4Addr> {
-            None
+
+        fn set_opt(&self, opt: libc::c_int, val: libc::c_int) -> bool {
+            unsafe {
+                libc::setsockopt(
+                    self.fd,
+                    libc::IPPROTO_IP,
+                    opt,
+                    &val as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&val) as libc::socklen_t,
+                ) == 0
+            }
+        }
+
+        /// Returns the address of the replying host (router or target).
+        pub fn ping(&self, dst: Ipv4Addr, ttl: u8, timeout_ms: u32) -> Option<Ipv4Addr> {
+            let seq = self.seq.get().wrapping_add(1);
+            self.seq.set(seq);
+            if !self.set_opt(libc::IP_TTL, ttl as libc::c_int) || !self.send(dst, seq) {
+                return None;
+            }
+            let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                let mut pfd = libc::pollfd { fd: self.fd, events: libc::POLLIN, revents: 0 };
+                if unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) } <= 0 {
+                    continue;
+                }
+                while let Some(got) = self.read(dst, seq) {
+                    match got {
+                        Got::Reply(addr) => return Some(addr),
+                        Got::Failed => return None,
+                        Got::Other => {}
+                    }
+                }
+            }
+        }
+
+        fn send(&self, dst: Ipv4Addr, seq: u16) -> bool {
+            let mut pkt = [0x41u8; 40];
+            pkt[0] = ECHO_REQUEST;
+            pkt[1] = 0;
+            pkt[2..4].fill(0);
+            pkt[4..6].copy_from_slice(&self.id.to_be_bytes());
+            pkt[6..8].copy_from_slice(&seq.to_be_bytes());
+            let sum = checksum(&pkt);
+            pkt[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut sa: libc::sockaddr_in = unsafe { std::mem::zeroed() };
+            #[cfg(target_os = "macos")]
+            {
+                sa.sin_len = std::mem::size_of::<libc::sockaddr_in>() as u8;
+            }
+            sa.sin_family = libc::AF_INET as libc::sa_family_t;
+            sa.sin_addr.s_addr = u32::from_ne_bytes(dst.octets());
+            let n = unsafe {
+                libc::sendto(
+                    self.fd,
+                    pkt.as_ptr() as *const libc::c_void,
+                    pkt.len(),
+                    0,
+                    &sa as *const _ as *const libc::sockaddr,
+                    std::mem::size_of_val(&sa) as libc::socklen_t,
+                )
+            };
+            n == pkt.len() as isize
+        }
+
+        /// Reads one pending packet or error; None when nothing is pending.
+        #[cfg(target_os = "linux")]
+        fn read(&self, dst: Ipv4Addr, seq: u16) -> Option<Got> {
+            let mut buf = [0u8; 512];
+            // Router answers (Time Exceeded, Unreachable) arrive on the error queue.
+            let mut ctrl = [0u64; 64];
+            let mut iov = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+            let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+            msg.msg_iov = &mut iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = std::mem::size_of_val(&ctrl) as _;
+            let n = unsafe { libc::recvmsg(self.fd, &mut msg, libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) };
+            if n >= 0 {
+                // Payload is our original echo request.
+                if n < 8 || buf[6..8] != seq.to_be_bytes() {
+                    return Some(Got::Other);
+                }
+                let mut c = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+                while !c.is_null() {
+                    let h = unsafe { &*c };
+                    if h.cmsg_level == libc::IPPROTO_IP && h.cmsg_type == libc::IP_RECVERR {
+                        let ee = unsafe { &*(libc::CMSG_DATA(c) as *const libc::sock_extended_err) };
+                        if ee.ee_origin != libc::SO_EE_ORIGIN_ICMP {
+                            return Some(Got::Other);
+                        }
+                        if ee.ee_type != TIME_EXCEEDED {
+                            return Some(Got::Failed);
+                        }
+                        // SO_EE_OFFENDER: sockaddr of the router follows the struct.
+                        let from = unsafe {
+                            std::ptr::read_unaligned(
+                                (ee as *const libc::sock_extended_err).add(1) as *const libc::sockaddr_in,
+                            )
+                        };
+                        return Some(Got::Reply(Ipv4Addr::from(from.sin_addr.s_addr.to_ne_bytes())));
+                    }
+                    c = unsafe { libc::CMSG_NXTHDR(&msg, c) };
+                }
+                return Some(Got::Other);
+            }
+            // Echo replies arrive as normal data, without IP header; the kernel
+            // only delivers replies matching this socket's identifier.
+            let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+            if n < 0 {
+                return None;
+            }
+            Some(if n >= 8 && buf[0] == ECHO_REPLY && buf[6..8] == seq.to_be_bytes() {
+                Got::Reply(dst)
+            } else {
+                Got::Other
+            })
+        }
+
+        /// Reads one pending packet; None when nothing is pending. macOS delivers
+        /// all ICMP packets including the IP header, so filter on id and sequence.
+        #[cfg(not(target_os = "linux"))]
+        fn read(&self, _dst: Ipv4Addr, seq: u16) -> Option<Got> {
+            let mut buf = [0u8; 512];
+            let n = unsafe { libc::recv(self.fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), libc::MSG_DONTWAIT) };
+            if n < 0 {
+                return None;
+            }
+            let pkt = &buf[..n as usize];
+            let ours = |icmp: &[u8]| icmp.len() >= 8 && icmp[4..6] == self.id.to_be_bytes() && icmp[6..8] == seq.to_be_bytes();
+            let Some((from, icmp)) = split_ip(pkt) else { return Some(Got::Other) };
+            Some(match icmp.first() {
+                Some(&ECHO_REPLY) if ours(icmp) => Got::Reply(from),
+                Some(&t @ (TIME_EXCEEDED | DEST_UNREACH)) if icmp.len() > 8 => match split_ip(&icmp[8..]) {
+                    Some((_, inner)) if inner.first() == Some(&ECHO_REQUEST) && ours(inner) => {
+                        if t == TIME_EXCEEDED {
+                            Got::Reply(from)
+                        } else {
+                            Got::Failed
+                        }
+                    }
+                    _ => Got::Other,
+                },
+                _ => Got::Other,
+            })
+        }
+    }
+
+    /// Splits an IPv4 packet into (source address, payload).
+    #[cfg(not(target_os = "linux"))]
+    fn split_ip(pkt: &[u8]) -> Option<(Ipv4Addr, &[u8])> {
+        let hl = (*pkt.first()? as usize & 0x0f) * 4;
+        (pkt.len() >= hl && hl >= 20).then(|| (Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]), &pkt[hl..]))
+    }
+
+    fn checksum(data: &[u8]) -> u16 {
+        let mut sum: u32 = data.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]) as u32).sum();
+        while sum > 0xffff {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    impl Drop for Pinger {
+        fn drop(&mut self) {
+            unsafe { libc::close(self.fd) };
         }
     }
 }

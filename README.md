@@ -1,7 +1,11 @@
 # PingPlot
 
-PingPlotter-style traceroute/ping monitor for Windows. Single exe, no service, no admin rights
-(uses the Windows ICMP API `IcmpSendEcho`, like WinMTR).
+PingPlotter-style traceroute/ping monitor for Windows, Linux and macOS. Single binary, no service,
+no admin/root rights. Windows uses the ICMP API `IcmpSendEcho` (like WinMTR); Linux and macOS use
+unprivileged ICMP datagram sockets.
+
+Linux needs your group in `net.ipv4.ping_group_range` (the default on most distributions and WSL;
+check with `sysctl net.ipv4.ping_group_range`). macOS support is untested.
 
 ![PingPlot tracing github.com](docs/screenshot.png)
 
@@ -24,6 +28,14 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 
 Output: `target/x86_64-pc-windows-gnu/release/pingplot.exe`.
 Console engine test: `cargo zigbuild --release --target x86_64-pc-windows-gnu --example trace`.
+
+## Build for Linux / macOS
+
+```
+cargo build --release
+```
+
+Output: `target/release/pingplot`. Runs under WSLg on WSL2.
 
 ## License
 

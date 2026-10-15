@@ -5,12 +5,15 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
-eframe = { version = "*", default-features = false, features = ["glow", "default_fonts"] }
+eframe = { version = "*", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }
 egui_plot = "*"
 dns-lookup = "*"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "*", features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_Networking_WinSock"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "*"
 
 [profile.release]
 opt-level = 3
