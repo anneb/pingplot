@@ -2,6 +2,7 @@
 name = "pingplot"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [dependencies]
 eframe = { version = "*", default-features = false, features = ["glow", "default_fonts"] }

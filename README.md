@@ -22,3 +22,7 @@ cargo zigbuild --release --target x86_64-pc-windows-gnu
 
 Output: `target/x86_64-pc-windows-gnu/release/pingplot.exe`.
 Console engine test: `cargo zigbuild --release --target x86_64-pc-windows-gnu --example trace`.
+
+## License
+
+MIT, see [LICENSE](LICENSE).
