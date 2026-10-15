@@ -3,6 +3,8 @@
 PingPlotter-style traceroute/ping monitor for Windows. Single exe, no service, no admin rights
 (uses the Windows ICMP API `IcmpSendEcho`, like WinMTR).
 
+![PingPlot tracing github.com](docs/screenshot.png)
+
 Features: per-hop loss and latency stats, latency graph across hops, timeline for the selected hop,
 adjustable interval and focus period, copy results as text.
 
